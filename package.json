@@ -1,0 +1,8 @@
+{
+  "name": "autogfeeder",
+  "main": "index.js",
+  "dependencies" : {
+    "crawler":  "~0.4.3",
+    "underscore": "~1.8.3"
+  }
+}
