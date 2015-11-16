@@ -9,12 +9,26 @@ var request = require("request");
 var cheerio = require("cheerio");
 var _ = require("underscore");
 var extend = require("util")._extend;
+var fs = require('fs');
+var readline = require('readline');
+var gInbox = require("./gInbox.js");
 var j = request.jar();
 request = request.defaults({jar:j});
 
 var user = process.env.user || "";
 var pass = process.env.pass || "";
-var feed = process.env.feed || "";
+var feed = process.env.feed || process.env.FEED || "";
+var etosub = process.env.etosub || "";
+var blacklist = process.env.blacklist || "blacklist.log"
+var blacklist_json = [];
+try {
+  blacklist_json = JSON.parse(fs.readFileSync(blacklist).toString());
+  console.log("read from blacklist from ", blacklist);
+}
+catch(e) {
+  console.log("read from blacklist from ", blacklist, " fail, ", e);
+}
+var captchaFilePath = "./captchaImg.png";
 
 var host = "https://feedburner.google.com";
 var headers = {
@@ -24,7 +38,18 @@ var headers = {
   "DNT": 1
 };
 
-var preparedToBurd = function (err, httpResponse, body, hs, gsessionid) {
+var formDataEncode = function(formData) {
+  return _.map(formData, function(e, i){ 
+    return i + "=" +encodeURIComponent(formData[i]);
+  }).join('&');
+};
+
+var preparedToBurd = function (err, feeders, opts) {
+  var httpResponse = opts.httpResponse, 
+  body = opts.body, 
+  hs = opts.hs, 
+  gsessionid = opts.gsessionid;
+
   delete hs['content-length'];
   console.log("Welcome! Let us burn a feed for you.");
   if (err) {
@@ -34,6 +59,7 @@ var preparedToBurd = function (err, httpResponse, body, hs, gsessionid) {
   var $ = cheerio.load(body);
   var params = [ "name", "from", "fbat", "mappedUri", "sourceUrl", "org.apache.struts.taglib.html.TOKEN"];
   var formData = {};
+  var feedName;
 
   _.each(params, function(e, i){
     formData[e] = $("[name='"+e+"']").first().val();
@@ -42,10 +68,26 @@ var preparedToBurd = function (err, httpResponse, body, hs, gsessionid) {
   formData.podcast = "false";
   formData.authenticationAction = "register";
 
+  feedName = formData.name;
+
   console.log("Feed Title:", formData.name);
   if (!formData.name) {
     console.log("no feed");
-    console.log("formData", formData);
+    return false;
+  }
+
+  var idx = feeders.indexOf(formData.name);
+  if (-1 !== idx) {
+    console.log("duplicate feed: ", formData.name, "in feeders(",
+        idx,
+        "), 81");
+    return false;
+  }
+
+  idx = blacklist_json.indexOf(formData.name);
+  if (-1 !== idx) {
+    console.log("duplicate feed: ", formData.name, " in blacklist(", 
+        idx, "), 81");
     return false;
   }
 
@@ -54,7 +96,7 @@ var preparedToBurd = function (err, httpResponse, body, hs, gsessionid) {
     headers: hs,
     //formData: formData,
     json: true,
-    body: _.map(formData, function(e, i){ return i + "=" +formData[i];}).join('&'),
+    body: formDataEncode(formData),
     jar: j
   }, function optionalCallback(err, httpResponse, body) {
     console.log("Congrats! Your FeedBurner feed is now live. Want to dress it up a little?");
@@ -71,7 +113,7 @@ var preparedToBurd = function (err, httpResponse, body, hs, gsessionid) {
     formData.emailSyndicationEnabled = "true";
     formData.isSave = "false";
 
-    var b =  _.map(formData, function(e, i){ return i + "=" +encodeURIComponent(formData[i]);}).join('&'), 
+    var b = formDataEncode(formData),
     c = b.length;
     hs['content-length'] = c;
 
@@ -110,7 +152,7 @@ var preparedToBurd = function (err, httpResponse, body, hs, gsessionid) {
         //formData: formData,
         json: true,
         //body: b,
-        body: _.map(formData, function(e, i){ return i + "=" +encodeURIComponent(formData[i]);}).join('&'),
+        body: formDataEncode(formData),
         jar: j
       }, function optionalCallback(err, httpResponse, body) {
         console.log("Subscription Management");
@@ -118,9 +160,94 @@ var preparedToBurd = function (err, httpResponse, body, hs, gsessionid) {
           return console.error('failed:', err);
         }
         //console.log(body);
-        var $ = cheerio.load(body);
+        var $ = cheerio.load(body),
+        subUrl,
+        formData = {};
+
         $ = cheerio.load($('textarea').val());
-        console.log($("form").first().attr("onsubmit").split(',')[0].split("'")[1]);
+        subUrl = $("form").first().attr("onsubmit").split(',')[0].split("'")[1];
+        console.log(subUrl);
+
+        formData.email = etosub;
+
+        request.post({
+          body: formDataEncode(formData),
+          url: subUrl,
+        }, function (error, httpResponse, body) {
+          if (!error && httpResponse.statusCode == 200) {
+            //console.log(httpResponse);
+            //console.log(body);
+
+            var formData = {};
+            var hs = extend({}, headers);
+            var $ = cheerio.load(body);
+            var imgUrl = $("form img").first().attr("src");
+            formData.email = etosub;
+            formData.uri = $("input[name=uri]").first().val();
+            formData.token = $("input[name=token]").first().val();
+            console.log("Email Subscription Request - ", $("form > p").first().text());
+            hs.Referer = host + "/fb/a/myfeeds";
+
+            var reSendCaptcha = function(imgUrl, token) {
+              var r = request.get(host + "/fb/a/" + imgUrl);
+              r.on('response', function(response) {
+                var writeStream = response.pipe(fs.createWriteStream(captchaFilePath));
+                writeStream.on('close', function() {
+                    var rl = readline.createInterface({
+                      input: process.stdin,
+                      output: process.stdout
+                    });
+
+                    rl.question('we save png in '+captchaFilePath+', Enter the code from that captchaFile here: ', function(code) {
+                      rl.close();
+                      console.log("ur enter, ", code);
+
+                      formData.captcha = code;
+                      formData.token = token;
+
+                      var hs = extend({}, headers);
+                      hs.Referer = subUrl;
+                      //console.log(formData, "formData");
+
+                      request.post({
+                        headers: hs,
+                        json: true,
+                        body: _.map(formData, function(e, i){ return i + "=" +formData[i];}).join('&'),
+                        //body: _.map(formData, function(e, i){ return i + "=" +formData[i];}).join('&'),
+                        url: subUrl,
+                      }, function (error, httpResponse, body) {
+                        if (!error && httpResponse.statusCode == 200) {
+                          //console.log(httpResponse);
+                          //console.log(body);
+                          //console.log("formDataEncode(formData)", formDataEncode(formData));
+                          if (-1 === body.indexOf("Your request has been accepted!")) {
+                            console.error("something wrong, plz refill again");
+                            var $ = cheerio.load(body);
+                            var imgUrl = $("form img").first().attr("src");
+                            var token = $("input[name=token]").first().val();
+
+                            reSendCaptcha(imgUrl, token);
+                          }
+                          else {
+                            console.log("Your request has been accepted!, delay 5s");
+                            setTimeout(gInbox.accessInbox, 5000, feedName);
+                            return;
+                            //gInbox.accessInbox(feedName);
+                          }
+                        }
+                      });
+                    });
+                });
+
+                writeStream.on('error', function(err) {
+                  console.error(err);
+                  //this.end();
+                });
+              });
+            }
+            reSendCaptcha(imgUrl, formData.token);
+          }
+        });
       });
     });
   });
@@ -235,6 +362,13 @@ request(host, function(error, result, body) {
             var formData = {};
             var hs = extend({}, headers);
             var $ = cheerio.load(body);
+            var feeders = $("td.title").map(function(index, element){
+              return ($(this).text().trim());
+            }).get();
+            var opts = {};
+
+            opts.hs = hs;
+            opts.gsessionid = gsessionid;
 
             formData.fbat = $("[name='fbat']").first().val();
             formData.from = $("[name='from']").first().val();
@@ -262,7 +396,9 @@ request(host, function(error, result, body) {
               var name = $("[name='name']").first().val();
               if (name) {
                 // directly goto
-                preparedToBurd(err, httpResponse, body, hs, gsessionid);
+                opts.httpResponse = httpResponse;
+                opts.body = body;
+                preparedToBurd(err, feeders, opts);
                 return;
               }
 
@@ -271,7 +407,7 @@ request(host, function(error, result, body) {
               formData.podcast = "false";
               formData.sourceUrl = $("[name='sourceUrl']:checked").val();
 
-              var b =  _.map(formData, function(e, i){ return i + "=" +encodeURIComponent(formData[i]);}).join('&'), 
+              var b =  formDataEncode(formData),
               c = b.length;
 
               hs.Referer = host + "/fb/a/addfeed";
@@ -285,7 +421,9 @@ request(host, function(error, result, body) {
                 body: b,
                 jar: j
               }, function optionalCallback(err, httpResponse, body) {
-                preparedToBurd(err, httpResponse, body, hs, gsessionid);
+                opts.httpResponse = httpResponse;
+                opts.body = body;
+                preparedToBurd(err, feeders, opts);
               });
             });
           }
